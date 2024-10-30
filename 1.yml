@@ -1,105 +1,1087 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: "CloudFormation Template for Separate ASM WebApp and Portal Infrastructure"
-
+Description: Smartvault MFA (aPersona) resources for this Account
 Parameters:
-  EnvId:
+  Owner:
+    Description: The key contact / stack holder of this stack
     Type: String
-    Description: Environment ID (e.g., dev, stg, prod)
-    Default: "dev"
+    Default: devops@smartvault.com
+  EnvId:
+    Description: The environment ID that this stack is being deployed for
+    Type: String
+    AllowedPattern: "[A-Za-z0-9]+"
+    MaxLength: 15
+    Default: dev
   ImageId:
+    Description: The custom built AMI on top of base image AL2023
     Type: AWS::EC2::Image::Id
-    Description: AMI ID to use for instances
+    Default: ami-013fddae5de8227d2
+  UpgradeDB:
+    Description: Is the SQL upgrade required?
+    Type: String
+    AllowedValues:
+      - "True"
+      - "False"
+  MySQLEngineVersion:
+    Description: MySQL Engine version
+    Type: String
+    Default: 5.7.44
+  RdsStorageType:
+    Description: Type of RDS storage class
+    Type: String
+    Default: gp3
   InstanceType:
+    Description: The EC2 instance type
     Type: String
     Default: t3.medium
-  WebAppASGMin:
+  ASGmin:
+    Description: AutoScaling Group Minimum Instances
     Type: Number
     Default: 1
-  WebAppASGDesired:
-    Type: Number
-    Default: 2
-  WebAppASGMax:
-    Type: Number
-    Default: 3
-  PortalASGMin:
+  ASGdesired:
+    Description: AutoScaling Group Desired Instances
     Type: Number
     Default: 1
-  PortalASGDesired:
+  ASGmax:
+    Description: AutoScaling Group Maximum Instances
     Type: Number
     Default: 1
-  PortalASGMax:
-    Type: Number
-    Default: 1
-
+  MFAVersion:
+    Description: The ASM installation version (default version is 3.3.0)
+    Type: String
+    Default: 3.3.0
+  SecretKeyTwilio:
+    Description: Twilio callback secret key (stored in secrets manager)
+    Type: String
+    Default: YourSecretKeyHere
+    NoEcho: true
+  DBUser:
+    Description: The username of the RDS MySQL instance
+    Type: String
+    Default: root
+  DBPassword:
+    Description: The password of the RDS MySQL instance
+    Type: String
+    NoEcho: true
+    Default: password
+  WeeklyScheduleDown:
+    Description: Time at which the instance will be stopped on week days. (Cron Expression)
+    Type: String
+    Default: 15 3 * * 1-5
+  WeeklyScheduleUp:
+    Description: Time at which the instance will be started on week days. (Cron Expression)
+    Type: String
+    Default: 15 13 * * 1-5
+  WeekendScheduleDown:
+    Description: Time at which the instance will be stopped on weekend. (Cron Expression)
+    Type: String
+    Default: 15 3 * * 6
+  CostSaving:
+    Description: "True: For staging environment. False: For production environment."
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
 Mappings:
-  EnvDomainMap:
-    dev:
-      Domain: "dev.smartvault.com"
-    stg:
-      Domain: "stg.smartvault.com"
-    prod:
-      Domain: "smartvault.com"
-
+  "764285433653":
+    all-regions:
+      InstanceMonitoring: true
+      Domain: dev.smartvault.com
+      AlbDeregistrationDelay: 0
+      EnableHostnamePrefix: false
+    us-east-2:
+      keypair: smartvault-development-us-east-2
+  "450560603497":
+    all-regions:
+      InstanceMonitoring: true
+      Domain: stg.smartvault.com
+      AlbDeregistrationDelay: 0
+      EnableHostnamePrefix: false
+    us-east-2:
+      keypair: smartvault-staging-us-east-2
+  "587105464662":
+    all-regions:
+      InstanceMonitoring: true
+      Domain: smartvault.com
+      AlbDeregistrationDelay: 300
+      EnableHostnamePrefix: false
+    us-east-2:
+      keypair: smartvault-production-us-east-2
+Conditions:
+  EnableHostnamePrefix: !Equals
+    - !FindInMap
+      - !Ref AWS::AccountId
+      - all-regions
+      - EnableHostnamePrefix
+    - true
+  ScheduleEnabled: !Equals
+    - !Ref CostSaving
+    - true
+  IsAccountProd: !Equals
+    - !Ref AWS::AccountId
+    - "764285433653"
+  UpgradeDBCondition: !Equals
+    - !Ref UpgradeDB
+    - "True"
 Resources:
+  aPersonalogGroupdataprotectionpolicy:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /smartvault/mfa/apersona
+      RetentionInDays: 365
+      DataProtectionPolicy:
+        Name: data-protection-policy
+        Description: log group custom data protection policy for masking otp
+        Version: "2021-06-01"
+        Statement:
+          - Sid: audit-policy
+            DataIdentifier:
+              - Otp
+              - otp
+              - OTP_SENT
+              - o
+              - verificationCode
+              - About-to-send-OTP
+              - catalina_otp
+              - entered-OTP
+            Operation:
+              Audit:
+                FindingsDestination: {}
+          - Sid: redact-policy
+            DataIdentifier:
+              - Otp
+              - otp
+              - OTP_SENT
+              - o
+              - verificationCode
+              - About-to-send-OTP
+              - catalina_otp
+              - entered-OTP
+            Operation:
+              Deidentify:
+                MaskConfig: {}
+        Configuration:
+          CustomDataIdentifier:
+            - Name: Otp
+              Regex: Otp:[0-9]{6}
+            - Name: otp
+              Regex: otp=[0-9]{6}
+            - Name: OTP_SENT
+              Regex: OTP_SENT=[0-9]{6}
+            - Name: o
+              Regex: o=[0-9]{6}
+            - Name: verificationCode
+              Regex: verificationCode=[0-9]{6}
+            - Name: About-to-send-OTP
+              Regex: About to send OTP:[0-9]{6}
+            - Name: catalina_otp
+              Regex: "&nbsp;[0-9]{6}&"
+            - Name: entered-OTP
+              Regex: entered OTP:[0-9]{6}
+
+  MFACloudWatchLoggroupAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: IsAccountProd
+    Properties:
+      ManagedPolicyName: MFACloudWatchLoggroupAccess
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Action: logs:*
+            Resource: !Sub arn:aws:logs:us-east-2:${AWS::AccountId}:log-group:/smartvault/mfa/apersona:*
+            Condition:
+              StringNotEquals:
+                aws:PrincipalArn:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/smartvault-${EnvId}-iam-role-mfa
+                  - !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/smartvault-${EnvId}-iam-instanceprofile-mfa
+                  - !Sub arn:aws:iam::${AWS::AccountId}:user/abhishek.pathak
+                  - !Sub arn:aws:iam::${AWS::AccountId}:user/corey.pon
+                  - !Sub arn:aws:iam::${AWS::AccountId}:user/manikprabhu.rajendra
   LaunchTemplateWebApp:
     Type: AWS::EC2::LaunchTemplate
-    Properties:
-      LaunchTemplateName: !Sub "smartvault-${EnvId}-webapp-launch-template"
-      LaunchTemplateData:
-        ImageId: !Ref ImageId
-        InstanceType: !Ref InstanceType
-        SecurityGroupIds:
-          - !ImportValue "smartvault-${EnvId}-secgrp-webapp"
-        UserData: !Base64 |
-          #!/bin/bash
-          echo "Starting WebApp setup..."
+    DependsOn:
+      - mfaRDSInstance
+    Metadata:
+      Comment: Bootstrap
+      AWS::CloudFormation::Init:
+        configSets:
+          bootstrap:
+            - install_cfn
+            - upgrade-db-script
+            - JVM-Heapsize
+            - configure_mfa            
+            - configure_cloudwatch
+            - start_services
+            - finalise
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.launchTemplateMFA.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource launchTemplateMFA --configsets bootstrap --region ${AWS::Region}
+                runas=root
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
 
-  LaunchTemplatePortal:
+        upgrade-db-script:
+          commands:
+            upgrade:
+              command: !Sub |
+                LOG_FILE="/var/log/db-script.log"
+                PARAMETER_NAME="/${EnvId}/apersona/dbupgrade"
+
+                if [ "${UpgradeDB}" == "True" ]; then                  
+                  UPGRADE_STATUS=$(aws ssm get-parameter --name "$PARAMETER_NAME" --query "Parameter.Value" --output text 2>/dev/null || echo "Not Found")
+                  if [ "$UPGRADE_STATUS" == "True" ]; then
+                    echo "Error: Database upgrade has already been performed." >> "$LOG_FILE" 2>&1 
+                    sudo systemctl restart tomcat
+                  else                   
+                    echo "Upgrading the database..." >> "$LOG_FILE" 2>&1
+                    mysql -u root -p"${DBPassword}" -h "${route53RDSMFA}" --force < "/home/ec2-user/aPersona_ASM_v${MFAVersion}_Product/asm_v${MFAVersion}_upgrade.sql"                    
+                    aws ssm put-parameter --name "$PARAMETER_NAME" --value "True" --type String --overwrite 
+                    echo "Database upgrade complete." >> "$LOG_FILE" 2>&1    
+                    sudo systemctl restart tomcat
+                  fi
+                else
+                  echo "Skipping DB upgrade." >> "$LOG_FILE" 2>&1                  
+                fi
+              env:
+                UpgradeDB: !Ref UpgradeDB                
+
+        JVM-Heapsize:
+          commands:
+            jvm-set:
+              command: !Sub |
+                path="/var/lib/tomcat/bin/setenv.sh"
+
+                if [[ "${EnvId}" == "dev" || "${EnvId}" == "stg" ]]; then
+                  echo 'CATALINA_OPTS="-Xms1024M -Xmx2048M"' > $path
+                 else
+                  echo 'CATALINA_OPTS="-Xms4096M -Xmx8192M"' > $path
+                fi
+                chmod +x $path
+                sudo cd /var/lib/tomcat/bin/ && setenv.sh
+                sudo systemctl restart tomcat
+        configure_mfa:
+          files:
+            /var/lib/tomcat/webapps/asm/WEB-INF/classes/apersona-db.properties:
+              content: !Sub |
+                # DB properties for apersona database
+                #MySql
+                db.driverClassName=com.mysql.jdbc.Driver
+                db.url=jdbc:mysql://${route53RDSMFA}:3306/apersona
+                db.username=root
+                db.password=${DBPassword}
+                db.jpa.database=MYSQL
+                #########################################################################################################
+                # Please don't forget to run the asmdb-v${MFAVersion}-Install.sql script on the RDS/db instance and update db.url
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm_portal/WEB-INF/classes/apersona-db.properties:
+              content: !Sub |
+                # DB properties for apersona database
+                #MySql
+                db.driverClassName=com.mysql.jdbc.Driver
+                db.url=jdbc:mysql://${route53RDSMFA}:3306/apersona
+                db.username=root
+                db.password=${DBPassword}
+                db.jpa.database=MYSQL
+                #########################################################################################################
+                # Please don't forget to run the asmdb-v${MFAVersion}-Install.sql script on the RDS/db instance and update db.url
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm/WEB-INF/classes/apersona-twilio.properties:
+              content: !Sub
+                - |
+                  #############################################
+                  # Set ASM server instance for Twilio voice callback
+                  ##############################################
+                  TWILIO_CALLBACK_SERVICE=https://${prefix}asm.${domain}/asm_callback/twilio.ap
+                  TWILIO_CALLBACK_SECRET_KEY=${secretkey}
+                - domain: !FindInMap
+                    - !Ref AWS::AccountId
+                    - all-regions
+                    - Domain
+                  prefix: !If
+                    - EnableHostnamePrefix
+                    - !Ref EnvId
+                    - ""
+                  secretkey: !Ref SecretKeyTwilio
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm_portal/WEB-INF/classes/apersona-twilio.properties:
+              content: !Sub
+                - |
+                  #############################################
+                  # Set ASM server instance for Twilio voice callback
+                  ##############################################
+                  TWILIO_CALLBACK_SERVICE=https://${prefix}asm.${domain}/asm_callback/twilio.ap
+                  TWILIO_CALLBACK_SECRET_KEY=${secretkey}
+                - domain: !FindInMap
+                    - !Ref AWS::AccountId
+                    - all-regions
+                    - Domain
+                  prefix: !If
+                    - EnableHostnamePrefix
+                    - !Ref EnvId
+                    - ""
+                  secretkey: !Ref SecretKeyTwilio
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm_callback/WEB-INF/classes/asm-callback.properties:
+              content: !Sub |
+                #############################################
+                # Set Twilio voice callback properties
+                ##############################################
+                TWILIO_CALLBACK_SECRET_KEY=${SecretKeyTwilio}
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/ROOT/index.html:
+              content: !Sub |
+                <head>
+                  <meta http-equiv="refresh" content="0;url=https://asm.smartvault.com/asm_portal/login.ap">
+                </head>
+          commands:
+            01-change-file-permissions:
+              command: chmod 755 -R /var/lib/tomcat/webapps/{asm,asm_portal,asm_callback}
+            02-change-file-ownership:
+              command: chown -R tomcat:tomcat
+                /var/lib/tomcat/webapps/{asm,asm_portal,asm_callback}
+            03-remove-index.jsp:
+              command: rm -f /var/lib/tomcat/webapps/ROOT/index.jsp && rm -rf
+                /var/lib/tomcat/webapps/examples
+            04-update-phone-config.properties:
+              command: sed -i 's/true/false/g'
+                /var/lib/tomcat/webapps/asm/WEB-INF/classes/phone-coding.properties                
+                      
+        configure_cloudwatch:
+          files:
+            /opt/aws/asmportalmonitoringwithcloudwatch.sh:
+              content: !Sub |
+                #!/bin/bash
+                TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") && curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id
+                INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                http://169.254.169.254/latest/meta-data/instance-id)
+                ASGName=$(aws autoscaling describe-auto-scaling-instances --instance-ids $INSTANCE_ID --region ${AWS::Region} | grep "AutoScalingGroupName" | awk '{print $2}' | sed 's/[",]//g')
+                version='Version:${MFAVersion}'
+                cmd="`curl -s 'http://localhost:8080/asm_portal/about.ap' | grep -o $version`"
+                if [ $cmd == $version ]; then
+                  count=1
+                else
+                  count=0
+                fi
+                aws cloudwatch put-metric-data --namespace "System/Linux" --metric-name "ASMPortalStatus" --value $count --unit "Count" --dimensions AutoScalingGroupName=$ASGName --region ${AWS::Region}
+              mode: "000700"
+              owner: root
+              group: root
+          commands:
+            01-create_cron_job:
+              command: echo '* * * * * /bin/bash -c
+                "/opt/aws/asmportalmonitoringwithcloudwatch.sh" >>
+                crontaboutput.log 2>&1' | crontab -
+        start_services:
+          commands:
+            00-daemon-reload:
+              command: sudo systemctl daemon-reload
+            01-start-tomcat-systemboot:
+              command: sudo systemctl enable tomcat.service
+            02-start-tomcat:
+              command: sudo systemctl start tomcat.service
+        finalise:
+          commands:
+            1-signal-success:
+              command: !Sub |
+                /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource autoscalinggroupMFA --region ${AWS::Region}
+    Properties:
+      LaunchTemplateName: !Sub smartvault-${EnvId}-ec2-launchtemplate-mfa
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Name: !Sub smartvault-${EnvId}-iam-instanceprofile-mfa
+        ImageId: !Ref ImageId
+        Monitoring:
+          Enabled: !FindInMap
+            - !Ref AWS::AccountId
+            - all-regions
+            - InstanceMonitoring
+        InstanceType: !Ref InstanceType
+        KeyName: !FindInMap
+          - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - keypair
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: smartvault-${EnvId}-secgrp-mfa
+        UserData: !Base64
+          Fn::Join:
+            - ""
+            - - |
+                #!/bin/bash -xe
+              - |
+                yum update -y aws-cfn-bootstrap
+              - "/opt/aws/bin/cfn-init -v "
+              - "         --stack "
+              - !Ref AWS::StackName
+              - "         --resource launchTemplateMFA "
+              - "         --configsets bootstrap "
+              - "         --region "
+              - !Ref AWS::Region
+              - ""
+
+  LaunchTemplateASMPortal:
     Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - mfaRDSInstance
+    Metadata:
+      Comment: Bootstrap
+      AWS::CloudFormation::Init:
+        configSets:
+          bootstrap:
+            - install_cfn
+            - upgrade-db-script
+            - JVM-Heapsize
+            - configure_mfa            
+            - configure_cloudwatch
+            - start_services
+            - finalise
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.launchTemplateMFA.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource launchTemplateMFA --configsets bootstrap --region ${AWS::Region}
+                runas=root
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+
+        upgrade-db-script:
+          commands:
+            upgrade:
+              command: !Sub |
+                LOG_FILE="/var/log/db-script.log"
+                PARAMETER_NAME="/${EnvId}/apersona/dbupgrade"
+
+                if [ "${UpgradeDB}" == "True" ]; then                  
+                  UPGRADE_STATUS=$(aws ssm get-parameter --name "$PARAMETER_NAME" --query "Parameter.Value" --output text 2>/dev/null || echo "Not Found")
+                  if [ "$UPGRADE_STATUS" == "True" ]; then
+                    echo "Error: Database upgrade has already been performed." >> "$LOG_FILE" 2>&1 
+                    sudo systemctl restart tomcat
+                  else                   
+                    echo "Upgrading the database..." >> "$LOG_FILE" 2>&1
+                    mysql -u root -p"${DBPassword}" -h "${route53RDSMFA}" --force < "/home/ec2-user/aPersona_ASM_v${MFAVersion}_Product/asm_v${MFAVersion}_upgrade.sql"                    
+                    aws ssm put-parameter --name "$PARAMETER_NAME" --value "True" --type String --overwrite 
+                    echo "Database upgrade complete." >> "$LOG_FILE" 2>&1    
+                    sudo systemctl restart tomcat
+                  fi
+                else
+                  echo "Skipping DB upgrade." >> "$LOG_FILE" 2>&1                  
+                fi
+              env:
+                UpgradeDB: !Ref UpgradeDB                
+
+        JVM-Heapsize:
+          commands:
+            jvm-set:
+              command: !Sub |
+                path="/var/lib/tomcat/bin/setenv.sh"
+
+                if [[ "${EnvId}" == "dev" || "${EnvId}" == "stg" ]]; then
+                  echo 'CATALINA_OPTS="-Xms1024M -Xmx2048M"' > $path
+                 else
+                  echo 'CATALINA_OPTS="-Xms4096M -Xmx8192M"' > $path
+                fi
+                chmod +x $path
+                sudo cd /var/lib/tomcat/bin/ && setenv.sh
+                sudo systemctl restart tomcat
+        configure_mfa:
+          files:
+            /var/lib/tomcat/webapps/asm/WEB-INF/classes/apersona-db.properties:
+              content: !Sub |
+                # DB properties for apersona database
+                #MySql
+                db.driverClassName=com.mysql.jdbc.Driver
+                db.url=jdbc:mysql://${route53RDSMFA}:3306/apersona
+                db.username=root
+                db.password=${DBPassword}
+                db.jpa.database=MYSQL
+                #########################################################################################################
+                # Please don't forget to run the asmdb-v${MFAVersion}-Install.sql script on the RDS/db instance and update db.url
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm_portal/WEB-INF/classes/apersona-db.properties:
+              content: !Sub |
+                # DB properties for apersona database
+                #MySql
+                db.driverClassName=com.mysql.jdbc.Driver
+                db.url=jdbc:mysql://${route53RDSMFA}:3306/apersona
+                db.username=root
+                db.password=${DBPassword}
+                db.jpa.database=MYSQL
+                #########################################################################################################
+                # Please don't forget to run the asmdb-v${MFAVersion}-Install.sql script on the RDS/db instance and update db.url
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm/WEB-INF/classes/apersona-twilio.properties:
+              content: !Sub
+                - |
+                  #############################################
+                  # Set ASM server instance for Twilio voice callback
+                  ##############################################
+                  TWILIO_CALLBACK_SERVICE=https://${prefix}asm.${domain}/asm_callback/twilio.ap
+                  TWILIO_CALLBACK_SECRET_KEY=${secretkey}
+                - domain: !FindInMap
+                    - !Ref AWS::AccountId
+                    - all-regions
+                    - Domain
+                  prefix: !If
+                    - EnableHostnamePrefix
+                    - !Ref EnvId
+                    - ""
+                  secretkey: !Ref SecretKeyTwilio
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm_portal/WEB-INF/classes/apersona-twilio.properties:
+              content: !Sub
+                - |
+                  #############################################
+                  # Set ASM server instance for Twilio voice callback
+                  ##############################################
+                  TWILIO_CALLBACK_SERVICE=https://${prefix}asm.${domain}/asm_callback/twilio.ap
+                  TWILIO_CALLBACK_SECRET_KEY=${secretkey}
+                - domain: !FindInMap
+                    - !Ref AWS::AccountId
+                    - all-regions
+                    - Domain
+                  prefix: !If
+                    - EnableHostnamePrefix
+                    - !Ref EnvId
+                    - ""
+                  secretkey: !Ref SecretKeyTwilio
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/asm_callback/WEB-INF/classes/asm-callback.properties:
+              content: !Sub |
+                #############################################
+                # Set Twilio voice callback properties
+                ##############################################
+                TWILIO_CALLBACK_SECRET_KEY=${SecretKeyTwilio}
+              mode: "000644"
+              owner: tomcat
+              group: tomcat
+            /var/lib/tomcat/webapps/ROOT/index.html:
+              content: !Sub |
+                <head>
+                  <meta http-equiv="refresh" content="0;url=https://asm.smartvault.com/asm_portal/login.ap">
+                </head>
+          commands:
+            01-change-file-permissions:
+              command: chmod 755 -R /var/lib/tomcat/webapps/{asm,asm_portal,asm_callback}
+            02-change-file-ownership:
+              command: chown -R tomcat:tomcat
+                /var/lib/tomcat/webapps/{asm,asm_portal,asm_callback}
+            03-remove-index.jsp:
+              command: rm -f /var/lib/tomcat/webapps/ROOT/index.jsp && rm -rf
+                /var/lib/tomcat/webapps/examples
+            04-update-phone-config.properties:
+              command: sed -i 's/true/false/g'
+                /var/lib/tomcat/webapps/asm/WEB-INF/classes/phone-coding.properties                
+                      
+        configure_cloudwatch:
+          files:
+            /opt/aws/asmportalmonitoringwithcloudwatch.sh:
+              content: !Sub |
+                #!/bin/bash
+                TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600") && curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id
+                INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+                http://169.254.169.254/latest/meta-data/instance-id)
+                ASGName=$(aws autoscaling describe-auto-scaling-instances --instance-ids $INSTANCE_ID --region ${AWS::Region} | grep "AutoScalingGroupName" | awk '{print $2}' | sed 's/[",]//g')
+                version='Version:${MFAVersion}'
+                cmd="`curl -s 'http://localhost:8080/asm_portal/about.ap' | grep -o $version`"
+                if [ $cmd == $version ]; then
+                  count=1
+                else
+                  count=0
+                fi
+                aws cloudwatch put-metric-data --namespace "System/Linux" --metric-name "ASMPortalStatus" --value $count --unit "Count" --dimensions AutoScalingGroupName=$ASGName --region ${AWS::Region}
+              mode: "000700"
+              owner: root
+              group: root
+          commands:
+            01-create_cron_job:
+              command: echo '* * * * * /bin/bash -c
+                "/opt/aws/asmportalmonitoringwithcloudwatch.sh" >>
+                crontaboutput.log 2>&1' | crontab -
+        start_services:
+          commands:
+            00-daemon-reload:
+              command: sudo systemctl daemon-reload
+            01-start-tomcat-systemboot:
+              command: sudo systemctl enable tomcat.service
+            02-start-tomcat:
+              command: sudo systemctl start tomcat.service
+        finalise:
+          commands:
+            1-signal-success:
+              command: !Sub |
+                /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource autoscalinggroupMFA --region ${AWS::Region}
     Properties:
-      LaunchTemplateName: !Sub "smartvault-${EnvId}-portal-launch-template"
+      LaunchTemplateName: !Sub smartvault-${EnvId}-ec2-launchtemplate-mfa
       LaunchTemplateData:
+        IamInstanceProfile:
+          Name: !Sub smartvault-${EnvId}-iam-instanceprofile-mfa
         ImageId: !Ref ImageId
+        Monitoring:
+          Enabled: !FindInMap
+            - !Ref AWS::AccountId
+            - all-regions
+            - InstanceMonitoring
         InstanceType: !Ref InstanceType
+        KeyName: !FindInMap
+          - !Ref AWS::AccountId
+          - !Ref AWS::Region
+          - keypair
         SecurityGroupIds:
-          - !ImportValue "smartvault-${EnvId}-secgrp-portal"
-        UserData: !Base64 |
-          #!/bin/bash
-          echo "Starting Portal setup with cron jobs..."
+          - !ImportValue
+            Fn::Sub: smartvault-${EnvId}-secgrp-mfa
+        UserData: !Base64
+          Fn::Join:
+            - ""
+            - - |
+                #!/bin/bash -xe
+              - |
+                yum update -y aws-cfn-bootstrap
+              - "/opt/aws/bin/cfn-init -v "
+              - "         --stack "
+              - !Ref AWS::StackName
+              - "         --resource launchTemplateMFA "
+              - "         --configsets bootstrap "
+              - "         --region "
+              - !Ref AWS::Region
+              - ""
 
-  AutoScalingGroupWebApp:
+  autoscalinggroupMFA:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      AutoScalingGroupName: !Sub "smartvault-${EnvId}-webapp-asg"
+      Cooldown: 300
+      DesiredCapacity: !Ref ASGdesired
+      HealthCheckGracePeriod: 300
+      HealthCheckType: EC2
       LaunchTemplate:
-        LaunchTemplateId: !Ref LaunchTemplateWebApp
-        Version: !GetAtt LaunchTemplateWebApp.LatestVersionNumber
-      MinSize: !Ref WebAppASGMin
-      DesiredCapacity: !Ref WebAppASGDesired
-      MaxSize: !Ref WebAppASGMax
+        LaunchTemplateId: !Ref launchTemplateMFA
+        Version: !GetAtt launchTemplateMFA.LatestVersionNumber
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupInServiceInstances
+      MaxSize: !Ref ASGmax
+      MinSize: !Ref ASGmin
       VPCZoneIdentifier:
-        - !ImportValue "smartvault-${EnvId}-subnet-privateapp1"
-        - !ImportValue "smartvault-${EnvId}-subnet-privateapp2"
+        - !ImportValue
+          Fn::Sub: smartvault-${AWS::Region}-subnet-privateapp1
+        - !ImportValue
+          Fn::Sub: smartvault-${AWS::Region}-subnet-privateapp2
+      Tags:
+        - Key: Name
+          Value: !Sub smartvault-${EnvId}-ec2-asg-mfa
+          PropagateAtLaunch: "true"
+        - Key: Owner
+          Value: !Ref Owner
+          PropagateAtLaunch: "true"
+        - Key: UpgradeDB
+          Value: !Ref UpgradeDB
+          PropagateAtLaunch: "true"
       TargetGroupARNs:
-        - !Ref TargetGroupWebApp
-
-  AutoScalingGroupPortal:
-    Type: AWS::AutoScaling::AutoScalingGroup
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-tgt-mfa-8080
+        - !Ref internalTargetgroupMFA
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: "true"
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref ASGdesired
+        Timeout: PT15M
+  mfaWeeklyScheduledActionDown:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: ScheduleEnabled
     Properties:
-      AutoScalingGroupName: !Sub "smartvault-${EnvId}-portal-asg"
-      LaunchTemplate:
-        LaunchTemplateId: !Ref LaunchTemplatePortal
-        Version: !GetAtt LaunchTemplatePortal.LatestVersionNumber
-      MinSize: !Ref PortalASGMin
-      DesiredCapacity: !Ref PortalASGDesired
-      MaxSize: !Ref PortalASGMax
-      VPCZoneIdentifier:
-        - !ImportValue "smartvault-${EnvId}-subnet-privateapp1"
-        - !ImportValue "smartvault-${EnvId}-subnet-privateapp2"
-      TargetGroupARNs:
-        - !Ref TargetGroupPortal
+      AutoScalingGroupName: !Ref autoscalinggroupMFA
+      DesiredCapacity: 0
+      MaxSize: 2
+      MinSize: 0
+      Recurrence: !Ref WeeklyScheduleDown
+  mfaWeeklyScheduledActionUp:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: ScheduleEnabled
+    Properties:
+      AutoScalingGroupName: !Ref autoscalinggroupMFA
+      DesiredCapacity: !Ref ASGdesired
+      MaxSize: !Ref ASGmax
+      MinSize: !Ref ASGmin
+      Recurrence: !Ref WeeklyScheduleUp
+  mfaWeekendScheduledActionDown:
+    Type: AWS::AutoScaling::ScheduledAction
+    Condition: ScheduleEnabled
+    Properties:
+      AutoScalingGroupName: !Ref autoscalinggroupMFA
+      DesiredCapacity: 0
+      MaxSize: 2
+      MinSize: 0
+      Recurrence: !Ref WeekendScheduleDown
+  mfaRDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub smartvault-${EnvId}-rds-mfa
+      AllocatedStorage: "22"
+      DBInstanceClass: db.t3.medium
+      DBParameterGroupName: !Ref mfaDBParameterGroup
+      DBSubnetGroupName: !Ref mfaDBSubnetGroup
+      Engine: MySQL
+      EngineVersion: !Ref MySQLEngineVersion
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-secgrp-rds-mfa
+      StorageType: !Ref RdsStorageType
+      Tags:
+        - Key: Name
+          Value: !Sub smartvault-${EnvId}-rds-mfa
+        - Key: Owner
+          Value: !Ref Owner
+  mfaDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Parameter group for MFA (aPersona) Server - support for case
+        insensitive table names and default collation of UTF8 can be added as
+        needed
+      Family: mysql5.7
+      Tags:
+        - Key: Name
+          Value: !Sub smartvault-${EnvId}-paramgrp-rds-mfa
+        - Key: Owner
+          Value: !Ref Owner
+  mfaDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: MFA DB Subnet Group
+      DBSubnetGroupName: !Sub smartvault-${EnvId}-subnetgrp-rds-mfa
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: smartvault-${AWS::Region}-subnet-privatedata1
+        - !ImportValue
+          Fn::Sub: smartvault-${AWS::Region}-subnet-privatedata2
+      Tags:
+        - Key: Name
+          Value: !Sub smartvault-${EnvId}-subnetgrp-rds-mfa
+        - Key: Owner
+          Value: !Ref Owner
+  CloudWatchEC2CpuUtilization:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: autoscalinggroupMFA
+    Properties:
+      ActionsEnabled: true
+      InsufficientDataActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      OKActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmName: !Sub "smartvault-${EnvId}-ec2-mfa (${autoscalinggroupMFA}) : High CPU"
+      AlarmDescription: !Sub "smartvault-${EnvId}-ec2-mfa (${autoscalinggroupMFA}) : High CPU"
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref autoscalinggroupMFA
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: "60"
+      EvaluationPeriods: "5"
+      Period: "60"
+      Statistic: Average
+  CloudWatchEC2DiskUtilization:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: autoscalinggroupMFA
+    Properties:
+      ActionsEnabled: true
+      InsufficientDataActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      OKActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmName: !Sub "${autoscalinggroupMFA}: Low Free / Space"
+      AlarmDescription: !Sub "${autoscalinggroupMFA}: Low Free / Space"
+      Metrics:
+        - Label: DiskFree(/)-B
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref autoscalinggroupMFA
+              MetricName: DiskFree - /
+              Namespace: System/Linux
+            Period: 60
+            Stat: Average
+            Unit: Bytes
+          Id: m1
+          ReturnData: false
+        - Label: DiskFree(/)-MB
+          Expression: m1/(1000^2)
+          Id: e1
+          ReturnData: true
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Threshold: "1000"
+      EvaluationPeriods: "5"
+  CloudWatchEC2MemUtilization:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: autoscalinggroupMFA
+    Properties:
+      ActionsEnabled: true
+      InsufficientDataActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      OKActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmName: !Sub "${autoscalinggroupMFA}: Low Free Memory"
+      AlarmDescription: !Sub "${autoscalinggroupMFA}: Low Free Memory"
+      Metrics:
+        - Label: MemFree-B
+          MetricStat:
+            Metric:
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref autoscalinggroupMFA
+              MetricName: MemFree
+              Namespace: System/Linux
+            Period: 60
+            Stat: Average
+            Unit: Bytes
+          Id: m1
+          ReturnData: false
+        - Label: MemFree-MB
+          Expression: m1/(1000^2)
+          Id: e1
+          ReturnData: true
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Threshold: "512"
+      EvaluationPeriods: "5"
+  CloudWatchASMPortalStatus:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: autoscalinggroupMFA
+    Properties:
+      ActionsEnabled: true
+      InsufficientDataActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      OKActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmActions:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-sns-topic-alerts
+      AlarmName: !Sub "${autoscalinggroupMFA}: ASM Portal Status"
+      AlarmDescription: !Sub "${autoscalinggroupMFA}: ASM Portal Status"
+      MetricName: ASMPortalStatus
+      Namespace: System/Linux
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref autoscalinggroupMFA
+      ComparisonOperator: LessThanThreshold
+      Threshold: "1"
+      EvaluationPeriods: "5"
+      Period: "60"
+      Statistic: Average
+  route53RDSMFA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      ResourceRecords:
+        - !GetAtt mfaRDSInstance.Endpoint.Address
+      HostedZoneId: !ImportValue smartvault-route53-zoneid-internal
+      Name: !Sub
+        - ${prefix}mfadb.int.${domain}
+        - domain: !FindInMap
+            - !Ref AWS::AccountId
+            - all-regions
+            - Domain
+          prefix: !If
+            - EnableHostnamePrefix
+            - !Ref EnvId
+            - ""
+      Type: CNAME
+      TTL: "900"
+  internalAlbMFA:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Sub smartvault-s3-logging-${AWS::AccountId}
+        - Key: access_logs.s3.prefix
+          Value: ""
+      Name: !Sub smartvault-${EnvId}-intalb-mfa
+      Scheme: internal
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: smartvault-${EnvId}-secgrp-intelb-mfa
+      Subnets:
+        - !ImportValue
+          Fn::Sub: smartvault-${AWS::Region}-subnet-privateapp1
+        - !ImportValue
+          Fn::Sub: smartvault-${AWS::Region}-subnet-privateapp2
+      Tags:
+        - Key: Name
+          Value: !Sub smartvault-${EnvId}-intalb-mfa
+        - Key: Owner
+          Value: !Ref Owner
+  internalTargetgroupMFA:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /asm_portal/login.ap
+      HealthCheckPort: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      Name: !Sub smartvault-${EnvId}-tgt-mfa-8080-int
+      Port: 8080
+      Protocol: HTTP
+      Tags:
+        - Key: Name
+          Value: !Sub smartvault-${EnvId}-tgt-mfa-8080-int
+        - Key: Owner
+          Value: !Ref Owner
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: !FindInMap
+            - !Ref AWS::AccountId
+            - all-regions
+            - AlbDeregistrationDelay
+      UnhealthyThresholdCount: 2
+      VpcId: !ImportValue
+        Fn::Sub: smartvault-${AWS::Region}-vpc
+  internalListeneruleMFA:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref internalTargetgroupMFA
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - !Sub
+              - ${prefix}asm.int.${domain}
+              - domain: !FindInMap
+                  - !Ref AWS::AccountId
+                  - all-regions
+                  - Domain
+                prefix: !If
+                  - EnableHostnamePrefix
+                  - !Ref EnvId
+                  - ""
+      ListenerArn: !Ref internalListenerMFA
+      Priority: 80
+  internalListenerMFA:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: internalAlbMFA
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref internalTargetgroupMFA
+      LoadBalancerArn: !Ref internalAlbMFA
+      Port: "8080"
+      Protocol: HTTP
+  route53MFA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt internalAlbMFA.DNSName
+        EvaluateTargetHealth: false
+        HostedZoneId: !GetAtt internalAlbMFA.CanonicalHostedZoneID
+      HostedZoneId: !ImportValue smartvault-route53-zoneid-internal
+      Name: !Sub
+        - ${prefix}asm.int.${domain}
+        - domain: !FindInMap
+            - !Ref AWS::AccountId
+            - all-regions
+            - Domain
+          prefix: !If
+            - EnableHostnamePrefix
+            - !Ref EnvId
+            - ""
+      Type: A
+Outputs:
+  autoscalinggroupMFA:
+    Value: !Ref autoscalinggroupMFA
+    Export:
+      Name: !Sub smartvault-${EnvId}-asg-mfa
 
-  TargetGroupWebApp:
+
+########
+
+TargetGroupWebApp:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Name: !Sub "smartvault-${EnvId}-webapp-tg"
