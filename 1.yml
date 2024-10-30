@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "CloudFormation Template for Separate ASM WebApp and Portal Infrastructure"
+
+Parameters:
+  EnvId:
+    Type: String
+    Description: Environment ID (e.g., dev, stg, prod)
+    Default: "dev"
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID to use for instances
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  WebAppASGMin:
+    Type: Number
+    Default: 1
+  WebAppASGDesired:
+    Type: Number
+    Default: 2
+  WebAppASGMax:
+    Type: Number
+    Default: 3
+  PortalASGMin:
+    Type: Number
+    Default: 1
+  PortalASGDesired:
+    Type: Number
+    Default: 1
+  PortalASGMax:
+    Type: Number
+    Default: 1
+
+Mappings:
+  EnvDomainMap:
+    dev:
+      Domain: "dev.smartvault.com"
+    stg:
+      Domain: "stg.smartvault.com"
+    prod:
+      Domain: "smartvault.com"
+
+Resources:
+  LaunchTemplateWebApp:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "smartvault-${EnvId}-webapp-launch-template"
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !ImportValue "smartvault-${EnvId}-secgrp-webapp"
+        UserData: !Base64 |
+          #!/bin/bash
+          echo "Starting WebApp setup..."
+
+  LaunchTemplatePortal:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "smartvault-${EnvId}-portal-launch-template"
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !ImportValue "smartvault-${EnvId}-secgrp-portal"
+        UserData: !Base64 |
+          #!/bin/bash
+          echo "Starting Portal setup with cron jobs..."
+
+  AutoScalingGroupWebApp:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "smartvault-${EnvId}-webapp-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateWebApp
+        Version: !GetAtt LaunchTemplateWebApp.LatestVersionNumber
+      MinSize: !Ref WebAppASGMin
+      DesiredCapacity: !Ref WebAppASGDesired
+      MaxSize: !Ref WebAppASGMax
+      VPCZoneIdentifier:
+        - !ImportValue "smartvault-${EnvId}-subnet-privateapp1"
+        - !ImportValue "smartvault-${EnvId}-subnet-privateapp2"
+      TargetGroupARNs:
+        - !Ref TargetGroupWebApp
+
+  AutoScalingGroupPortal:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "smartvault-${EnvId}-portal-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplatePortal
+        Version: !GetAtt LaunchTemplatePortal.LatestVersionNumber
+      MinSize: !Ref PortalASGMin
+      DesiredCapacity: !Ref PortalASGDesired
+      MaxSize: !Ref PortalASGMax
+      VPCZoneIdentifier:
+        - !ImportValue "smartvault-${EnvId}-subnet-privateapp1"
+        - !ImportValue "smartvault-${EnvId}-subnet-privateapp2"
+      TargetGroupARNs:
+        - !Ref TargetGroupPortal
+
+  TargetGroupWebApp:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "smartvault-${EnvId}-webapp-tg"
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !ImportValue "smartvault-${EnvId}-vpc"
+      HealthCheckPath: "/health"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  TargetGroupPortal:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "smartvault-${EnvId}-portal-tg"
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !ImportValue "smartvault-${EnvId}-vpc"
+      HealthCheckPath: "/health"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  LoadBalancerWebApp:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "smartvault-${EnvId}-webapp-lb"
+      Scheme: internet-facing
+      SecurityGroups:
+        - !ImportValue "smartvault-${EnvId}-secgrp-lb-webapp"
+      Subnets:
+        - !ImportValue "smartvault-${EnvId}-subnet-public1"
+        - !ImportValue "smartvault-${EnvId}-subnet-public2"
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+
+  LoadBalancerPortal:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "smartvault-${EnvId}-portal-lb"
+      Scheme: internal
+      SecurityGroups:
+        - !ImportValue "smartvault-${EnvId}-secgrp-lb-portal"
+      Subnets:
+        - !ImportValue "smartvault-${EnvId}-subnet-private1"
+        - !ImportValue "smartvault-${EnvId}-subnet-private2"
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "60"
+
+  ListenerWebApp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupWebApp
+      LoadBalancerArn: !Ref LoadBalancerWebApp
+      Port: 80
+      Protocol: HTTP
+
+  ListenerPortal:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupPortal
+      LoadBalancerArn: !Ref LoadBalancerPortal
+      Port: 80
+      Protocol: HTTP
+
+  Route53RecordWebApp:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Sub "my.${EnvDomainMap.${EnvId}.Domain}"
+      Type: A
+      HostedZoneId: !ImportValue "smartvault-${EnvId}-route53-zoneid-public"
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancerWebApp.DNSName
+        HostedZoneId: !GetAtt LoadBalancerWebApp.CanonicalHostedZoneID
+
+  Route53RecordPortal:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Sub "mfa.int.${EnvDomainMap.${EnvId}.Domain}"
+      Type: A
+      HostedZoneId: !ImportValue "smartvault-${EnvId}-route53-zoneid-internal"
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancerPortal.DNSName
+        HostedZoneId: !GetAtt LoadBalancerPortal.CanonicalHostedZoneID
+
+Outputs:
+  WebAppASG:
+    Value: !Ref AutoScalingGroupWebApp
+    Description: "Auto Scaling Group for ASM WebApp"
+  PortalASG:
+    Value: !Ref AutoScalingGroupPortal
+    Description: "Auto Scaling Group for ASM Portal"
+  WebAppDNS:
+    Value: !Ref Route53RecordWebApp
+    Description: "DNS for ASM WebApp Load Balancer"
+  PortalDNS:
+    Value: !Ref Route53RecordPortal
+    Description: "DNS for ASM Portal Load Balancer"
